@@ -185,7 +185,41 @@ def home():
 # =========================================================
 # HEALTH
 # =========================================================
+@app.get("/api/youtube-test")
+def youtube_test():
+    url = request.args.get(
+        "url",
+        "https://www.youtube.com/watch?v=lSD_L-xic9o"
+    )
 
+    cookie_path = None
+
+    try:
+        options, cookie_path = yt_dlp_options()
+
+        options.update({
+            "format": "bestaudio/best",
+            "noplaylist": True,
+        })
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        return jsonify({
+            "success": True,
+            "title": info.get("title"),
+            "channel": info.get("channel"),
+            "duration": info.get("duration"),
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+    finally:
+        cleanup_cookie_file(cookie_path)
 @app.get("/api/health")
 def health():
     return jsonify({
