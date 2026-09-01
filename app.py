@@ -136,15 +136,18 @@ def create_cookie_file():
 
 
 def yt_dlp_options():
-    """
-    تنظیمات مشترک yt-dlp
-    """
-
     options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+
+        # انتخاب client مناسب‌تر برای YouTube
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["default", "web_embedded"]
+            }
+        }
     }
 
     cookie_path = None
