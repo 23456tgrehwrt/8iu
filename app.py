@@ -1,14 +1,18 @@
-from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
-import yt_dlp
-import requests
+import os
+import tempfile
 from urllib.parse import quote
 
-app = Flask(__name__)
+import requests
+import yt_dlp
+from flask import Flask, jsonify, request, Response
+from flask_cors import CORS
+
 
 # =========================================================
-# CORS
+# APP
 # =========================================================
+
+app = Flask(__name__)
 
 CORS(
     app,
@@ -23,7 +27,7 @@ CORS(
         "Content-Type",
         "Accept",
         "Origin",
-        "User-Agent"
+        "User-Agent",
     ],
     expose_headers=[
         "Content-Length",
@@ -31,13 +35,20 @@ CORS(
         "Accept-Ranges",
         "Content-Type",
         "ETag",
-        "Last-Modified"
-    ]
+        "Last-Modified",
+    ],
 )
 
 
 # =========================================================
-# Helpers
+# CONFIG
+# =========================================================
+
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "").strip()
+
+
+# =========================================================
+# HELPERS
 # =========================================================
 
 def format_duration(seconds):
@@ -60,26 +71,6 @@ def format_duration(seconds):
         return "00:00"
 
 
-def get_api_base():
-    """
-    Railway:
-    اگر RAILWAY_PUBLIC_DOMAIN موجود باشد از آن استفاده می‌کنیم.
-    در غیر این صورت از host فعلی درخواست استفاده می‌شود.
-    """
-
-    domain = request.headers.get("X-Forwarded-Host")
-
-    if domain:
-        return f"https://{domain}"
-
-    return request.host_url.rstrip("/")
-
-
-def make_stream_url(video_url):
-    base = get_api_base()
-    return f"{base}/api/stream?url={quote(video_url, safe='')}"
-
-
 def clean_text(value):
     if not value:
         return ""
@@ -87,25 +78,98 @@ def clean_text(value):
     return str(value).strip()
 
 
-# =========================================================
-# YouTube info
-# =========================================================
+def get_api_base():
+    forwarded_host = request.headers.get("X-Forwarded-Host")
 
-def get_yt_info(url):
-    ydl_opts = {
+    if forwarded_host:
+        return f"https://{forwarded_host.split(',')[0].strip()}"
+
+    return request.host_url.rstrip("/")
+
+
+def make_stream_url(video_url):
+    base = get_api_base()
+
+    return (
+        f"{base}/api/stream"
+        f"?url={quote(video_url, safe='')}"
+    )
+
+
+def create_cookie_file():
+    """
+    YOUTUBE_COOKIES را موقتاً به cookies.txt تبدیل می‌کند.
+    فایل بعد از استفاده حذف می‌شود.
+    """
+
+    if not YOUTUBE_COOKIES:
+        return None, None
+
+    cookie_data = YOUTUBE_COOKIES.replace("\r\n", "\n").replace("\r", "\n")
+
+    if not cookie_data.startswith("#"):
+        raise ValueError(
+            "YOUTUBE_COOKIES must be a Mozilla/Netscape cookies.txt file."
+        )
+
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".txt",
+        delete=False,
+    )
+
+    try:
+        temp_file.write(cookie_data)
+        temp_file.flush()
+        temp_file.close()
+
+        return temp_file.name, temp_file
+
+    except Exception:
+        try:
+            temp_file.close()
+        except Exception:
+            pass
+
+        return None, None
+
+
+def yt_dlp_options():
+    """
+    تنظیمات مشترک yt-dlp
+    """
+
+    options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        "format": "bestaudio/best",
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    cookie_path = None
+
+    if YOUTUBE_COOKIES:
+        cookie_path, _ = create_cookie_file()
+
+        if cookie_path:
+            options["cookiefile"] = cookie_path
+
+    return options, cookie_path
+
+
+def cleanup_cookie_file(cookie_path):
+    if not cookie_path:
+        return
+
+    try:
+        os.remove(cookie_path)
+    except Exception:
+        pass
 
 
 # =========================================================
-# Health
+# HOME
 # =========================================================
 
 @app.get("/")
@@ -113,20 +177,26 @@ def home():
     return jsonify({
         "success": True,
         "service": "Music API",
-        "status": "online"
+        "status": "online",
+        "youtube_cookies": bool(YOUTUBE_COOKIES)
     })
 
+
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/api/health")
 def health():
     return jsonify({
         "success": True,
-        "status": "ok"
+        "status": "ok",
+        "youtube_cookies": bool(YOUTUBE_COOKIES)
     })
 
 
 # =========================================================
-# CORS Preflight
+# OPTIONS / CORS
 # =========================================================
 
 @app.route("/api/<path:path>", methods=["OPTIONS"])
@@ -136,10 +206,15 @@ def cors_preflight(path):
     })
 
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, HEAD, OPTIONS"
+    )
+
     response.headers["Access-Control-Allow-Headers"] = (
         "Range, Content-Type, Accept, Origin, User-Agent"
     )
+
     response.headers["Access-Control-Expose-Headers"] = (
         "Content-Length, Content-Range, Accept-Ranges, "
         "Content-Type, ETag, Last-Modified"
@@ -154,9 +229,9 @@ def cors_preflight(path):
 
 @app.get("/api/search")
 def search():
-    q = request.args.get("q", "").strip()
+    query = request.args.get("q", "").strip()
 
-    if not q:
+    if not query:
         return jsonify({
             "success": False,
             "error": "Missing q parameter",
@@ -165,7 +240,6 @@ def search():
             "results": []
         }), 400
 
-    # limit
     try:
         limit = int(request.args.get("limit", 10))
     except Exception:
@@ -173,22 +247,21 @@ def search():
 
     limit = max(1, min(limit, 20))
 
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "extract_flat": True,
-            "default_search": f"ytsearch{limit}",
-        }
+    cookie_path = None
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_info = ydl.extract_info(
-                f"ytsearch{limit}:{q}",
+    try:
+        options, cookie_path = yt_dlp_options()
+
+        options["extract_flat"] = True
+        options["default_search"] = f"ytsearch{limit}"
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            data = ydl.extract_info(
+                f"ytsearch{limit}:{query}",
                 download=False
             )
 
-        entries = search_info.get("entries") or []
+        entries = data.get("entries") or []
 
         results = []
 
@@ -197,23 +270,24 @@ def search():
                 continue
 
             try:
+                video_id = item.get("id")
+
                 video_url = (
                     item.get("webpage_url")
                     or item.get("url")
                 )
 
-                if not video_url:
-                    video_id = item.get("id")
-
-                    if video_id:
-                        video_url = (
-                            f"https://www.youtube.com/watch?v={video_id}"
-                        )
+                if not video_url and video_id:
+                    video_url = (
+                        f"https://www.youtube.com/watch?v={video_id}"
+                    )
 
                 if not video_url:
                     continue
 
-                title = clean_text(item.get("title"))
+                title = clean_text(
+                    item.get("title")
+                )
 
                 if not title:
                     continue
@@ -237,12 +311,9 @@ def search():
                     item.get("thumbnail")
                 )
 
-                # بعضی نتایج extract_flat ممکن است thumbnail نداشته باشند
-                video_id = item.get("id")
-
                 if not image and video_id:
                     image = (
-                        f"https://i.ytimg.com/vi/"
+                        "https://i.ytimg.com/vi/"
                         f"{video_id}/hqdefault.jpg"
                     )
 
@@ -256,14 +327,15 @@ def search():
                     "url": video_url
                 })
 
-            except Exception as e:
-                # یک نتیجه خراب نباید کل search را 500 کند
-                print(f"[SEARCH] Skipping invalid result: {e}")
+            except Exception as item_error:
+                print(
+                    f"[SEARCH] skipped result: {item_error}"
+                )
                 continue
 
         return jsonify({
             "success": True,
-            "query": q,
+            "query": query,
             "count": len(results),
             "results": results
         })
@@ -274,10 +346,13 @@ def search():
         return jsonify({
             "success": False,
             "error": str(e),
-            "query": q,
+            "query": query,
             "count": 0,
             "results": []
         }), 500
+
+    finally:
+        cleanup_cookie_file(cookie_path)
 
 
 # =========================================================
@@ -294,8 +369,18 @@ def info():
             "error": "Missing url parameter"
         }), 400
 
+    cookie_path = None
+
     try:
-        data = get_yt_info(url)
+        options, cookie_path = yt_dlp_options()
+
+        options["format"] = "bestaudio/best"
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            data = ydl.extract_info(
+                url,
+                download=False
+            )
 
         return jsonify({
             "success": True,
@@ -326,6 +411,9 @@ def info():
             "error": str(e)
         }), 500
 
+    finally:
+        cleanup_cookie_file(cookie_path)
+
 
 # =========================================================
 # STREAM
@@ -341,22 +429,19 @@ def stream():
             "error": "Missing url parameter"
         }), 400
 
+    cookie_path = None
+    upstream = None
+
     try:
         # -------------------------------------------------
-        # Get direct audio URL
+        # Extract direct audio URL
         # -------------------------------------------------
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": True,
+        options, cookie_path = yt_dlp_options()
 
-            # فقط بهترین صدای قابل دسترس
-            "format": "bestaudio/best",
-        }
+        options["format"] = "bestaudio/best"
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(
                 url,
                 download=False
@@ -371,10 +456,8 @@ def stream():
             }), 500
 
         # -------------------------------------------------
-        # Forward Range
+        # Request headers
         # -------------------------------------------------
-
-        range_header = request.headers.get("Range")
 
         headers = {
             "User-Agent": (
@@ -387,11 +470,13 @@ def stream():
             "Accept": "*/*",
         }
 
+        range_header = request.headers.get("Range")
+
         if range_header:
             headers["Range"] = range_header
 
         # -------------------------------------------------
-        # Connect to upstream
+        # Upstream request
         # -------------------------------------------------
 
         upstream = requests.get(
@@ -403,10 +488,6 @@ def stream():
 
         status_code = upstream.status_code
 
-        # -------------------------------------------------
-        # Handle errors
-        # -------------------------------------------------
-
         if status_code >= 400:
             error_text = ""
 
@@ -414,8 +495,6 @@ def stream():
                 error_text = upstream.text[:500]
             except Exception:
                 pass
-
-            upstream.close()
 
             return jsonify({
                 "success": False,
@@ -425,7 +504,7 @@ def stream():
             }), status_code
 
         # -------------------------------------------------
-        # Headers
+        # Response headers
         # -------------------------------------------------
 
         content_type = (
@@ -433,26 +512,26 @@ def stream():
             or "audio/mpeg"
         )
 
-        content_length = upstream.headers.get(
-            "Content-Length"
+        content_length = (
+            upstream.headers.get("Content-Length")
         )
 
-        content_range = upstream.headers.get(
-            "Content-Range"
+        content_range = (
+            upstream.headers.get("Content-Range")
         )
 
-        accept_ranges = upstream.headers.get(
-            "Accept-Ranges"
+        accept_ranges = (
+            upstream.headers.get("Accept-Ranges")
         )
 
         etag = upstream.headers.get("ETag")
 
-        last_modified = upstream.headers.get(
-            "Last-Modified"
+        last_modified = (
+            upstream.headers.get("Last-Modified")
         )
 
         # -------------------------------------------------
-        # Generator
+        # Streaming generator
         # -------------------------------------------------
 
         def generate():
@@ -464,11 +543,10 @@ def stream():
                         yield chunk
 
             finally:
-                upstream.close()
-
-        # -------------------------------------------------
-        # Response
-        # -------------------------------------------------
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
 
         response = Response(
             generate(),
@@ -476,48 +554,69 @@ def stream():
             content_type=content_type
         )
 
+        # -------------------------------------------------
         # CORS
+        # -------------------------------------------------
+
         response.headers["Access-Control-Allow-Origin"] = "*"
+
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Range, Content-Type, Accept, Origin, User-Agent"
+        )
 
         response.headers["Access-Control-Expose-Headers"] = (
             "Content-Length, Content-Range, Accept-Ranges, "
             "Content-Type, ETag, Last-Modified"
         )
 
-        response.headers["Access-Control-Allow-Headers"] = (
-            "Range, Content-Type, Accept, Origin, User-Agent"
-        )
+        # -------------------------------------------------
+        # Range / Seek
+        # -------------------------------------------------
 
-        # Range / Seeking
         response.headers["Accept-Ranges"] = (
             accept_ranges or "bytes"
         )
 
         if content_length:
-            response.headers["Content-Length"] = content_length
+            response.headers["Content-Length"] = (
+                content_length
+            )
 
         if content_range:
-            response.headers["Content-Range"] = content_range
+            response.headers["Content-Range"] = (
+                content_range
+            )
 
         if etag:
             response.headers["ETag"] = etag
 
         if last_modified:
-            response.headers["Last-Modified"] = last_modified
+            response.headers["Last-Modified"] = (
+                last_modified
+            )
 
         return response
 
     except Exception as e:
         print(f"[STREAM ERROR] {e}")
 
+        if upstream:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
         return jsonify({
             "success": False,
             "error": str(e)
         }), 500
 
+    finally:
+        cleanup_cookie_file(cookie_path)
+
 
 # =========================================================
-# 404
+# ERROR HANDLERS
 # =========================================================
 
 @app.errorhandler(404)
@@ -528,10 +627,6 @@ def not_found(error):
     }), 404
 
 
-# =========================================================
-# 500
-# =========================================================
-
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({
@@ -541,12 +636,10 @@ def internal_error(error):
 
 
 # =========================================================
-# Local run
+# RUN
 # =========================================================
 
 if __name__ == "__main__":
-    import os
-
     port = int(
         os.environ.get("PORT", 8080)
     )
