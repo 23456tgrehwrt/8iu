@@ -114,96 +114,99 @@ def health():
 
 @app.get("/api/search")
 def search():
+    q = request.args.get("q", "").strip()
 
-    query = request.args.get("q", "").strip()
-
-    if not query:
-        return json_error("Missing q")
+    if not q:
+        return jsonify({
+            "success": False,
+            "error": "Missing q parameter"
+        }), 400
 
     try:
+        limit = int(request.args.get("limit", 10))
+    except ValueError:
+        limit = 10
 
-        try:
-            limit = int(request.args.get("limit", "10"))
-        except ValueError:
-            limit = 10
+    limit = max(1, min(limit, 20))
 
-        limit = max(1, min(limit, 20))
-
-        opts = {
+    try:
+        ydl_opts = {
             "quiet": True,
             "no_warnings": True,
-            "extract_flat": False,
-            "skip_download": True
+            "skip_download": True,
+            "extract_flat": True,
+            "default_search": f"ytsearch{limit}",
         }
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-
-            data = ydl.extract_info(
-                f"ytsearch{limit}:{query}",
-                download=False
-            )
 
         results = []
 
-        for item in data.get("entries", []):
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
 
+        entries = info.get("entries") or []
+
+        for item in entries:
             if not item:
                 continue
 
-            video_id = item.get("id")
+            video_url = item.get("webpage_url") or item.get("url")
 
-            if not video_id:
+            if not video_url:
                 continue
 
-            source_url = (
-                item.get("webpage_url")
-                or f"https://www.youtube.com/watch?v={video_id}"
-            )
+            try:
+                # فقط برای مواردی که metadata ناقص دارند
+                title = item.get("title") or ""
 
-            artist = (
-                item.get("channel")
-                or item.get("uploader")
-                or "Unknown"
-            )
+                artist = (
+                    item.get("channel")
+                    or item.get("uploader")
+                    or ""
+                )
 
-            artist_url = (
-                item.get("channel_url")
-                or item.get("uploader_url")
-            )
+                artist_url = (
+                    item.get("channel_url")
+                    or item.get("uploader_url")
+                    or ""
+                )
 
-            image = (
-                item.get("thumbnail")
-                or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-            )
-
-            result = {
-                "artist": artist,
-                "artist_url": artist_url,
-                "duration": format_duration(
+                duration = format_duration(
                     item.get("duration")
-                ),
-                "image": image,
-                "stream": make_stream_url(source_url),
-                "title": item.get("title"),
-                "url": source_url
-            }
+                )
 
-            results.append(result)
+                thumbnail = item.get("thumbnail") or ""
+
+                results.append({
+                    "artist": artist,
+                    "artist_url": artist_url,
+                    "duration": duration,
+                    "image": thumbnail,
+                    "stream": make_stream_url(video_url),
+                    "title": title,
+                    "url": video_url
+                })
+
+            except Exception as e:
+                print(f"Skipping invalid search result: {e}")
+                continue
 
         return jsonify({
             "success": True,
-            "query": query,
+            "query": q,
             "count": len(results),
             "results": results
         })
 
     except Exception as e:
+        print(f"Search error: {e}")
 
-        return json_error(
-            "Search failed",
-            500,
-            str(e)
-        )
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "query": q,
+            "count": 0,
+            "results": []
+        }), 500
 
 
 # =========================================================
