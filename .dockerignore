@@ -4,6 +4,7 @@ __pycache__
 *.pyd
 .git
 .gitignore
-venv
 .env
+venv
+.venv
 downloads
