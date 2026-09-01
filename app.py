@@ -1,13 +1,39 @@
 from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 import yt_dlp
 import requests
-import os
 from urllib.parse import quote
 
 app = Flask(__name__)
 
-CHUNK_SIZE = 64 * 1024
-REQUEST_TIMEOUT = 30
+# =========================================================
+# CORS
+# =========================================================
+
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": "*"
+        }
+    },
+    methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=[
+        "Range",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "User-Agent"
+    ],
+    expose_headers=[
+        "Content-Length",
+        "Content-Range",
+        "Accept-Ranges",
+        "Content-Type",
+        "ETag",
+        "Last-Modified"
+    ]
+)
 
 
 # =========================================================
@@ -17,74 +43,69 @@ REQUEST_TIMEOUT = 30
 def format_duration(seconds):
     try:
         seconds = int(seconds or 0)
-    except (ValueError, TypeError):
+
+        if seconds <= 0:
+            return "00:00"
+
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        return f"{minutes:02d}:{secs:02d}"
+
+    except Exception:
         return "00:00"
-
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    seconds = seconds % 60
-
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-    return f"{minutes:02d}:{seconds:02d}"
 
 
 def get_api_base():
     """
-    Build public Railway URL.
-
-    Railway can provide RAILWAY_PUBLIC_DOMAIN.
-    Otherwise use request host.
+    Railway:
+    اگر RAILWAY_PUBLIC_DOMAIN موجود باشد از آن استفاده می‌کنیم.
+    در غیر این صورت از host فعلی درخواست استفاده می‌شود.
     """
 
-    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    domain = request.headers.get("X-Forwarded-Host")
 
-    if railway_domain:
-        if not railway_domain.startswith("http"):
-            return f"https://{railway_domain}"
-
-        return railway_domain.rstrip("/")
+    if domain:
+        return f"https://{domain}"
 
     return request.host_url.rstrip("/")
 
 
-def get_yt_info(url):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "format": "bestaudio/best"
-    }
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def make_stream_url(source_url):
+def make_stream_url(video_url):
     base = get_api_base()
-
-    return (
-        f"{base}/api/stream?url="
-        f"{quote(source_url, safe='')}"
-    )
+    return f"{base}/api/stream?url={quote(video_url, safe='')}"
 
 
-def json_error(message, status=400, details=None):
-    data = {
-        "success": False,
-        "error": message
-    }
+def clean_text(value):
+    if not value:
+        return ""
 
-    if details:
-        data["details"] = details
-
-    return jsonify(data), status
+    return str(value).strip()
 
 
 # =========================================================
-# Home
+# YouTube info
+# =========================================================
+
+def get_yt_info(url):
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "format": "bestaudio/best",
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+# =========================================================
+# Health
 # =========================================================
 
 @app.get("/")
@@ -96,20 +117,39 @@ def home():
     })
 
 
-# =========================================================
-# Health
-# =========================================================
-
 @app.get("/api/health")
 def health():
     return jsonify({
         "success": True,
-        "status": "online"
+        "status": "ok"
     })
 
 
 # =========================================================
-# Search
+# CORS Preflight
+# =========================================================
+
+@app.route("/api/<path:path>", methods=["OPTIONS"])
+def cors_preflight(path):
+    response = jsonify({
+        "success": True
+    })
+
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Range, Content-Type, Accept, Origin, User-Agent"
+    )
+    response.headers["Access-Control-Expose-Headers"] = (
+        "Content-Length, Content-Range, Accept-Ranges, "
+        "Content-Type, ETag, Last-Modified"
+    )
+
+    return response
+
+
+# =========================================================
+# SEARCH
 # =========================================================
 
 @app.get("/api/search")
@@ -119,12 +159,16 @@ def search():
     if not q:
         return jsonify({
             "success": False,
-            "error": "Missing q parameter"
+            "error": "Missing q parameter",
+            "query": "",
+            "count": 0,
+            "results": []
         }), 400
 
+    # limit
     try:
         limit = int(request.args.get("limit", 10))
-    except ValueError:
+    except Exception:
         limit = 10
 
     limit = max(1, min(limit, 20))
@@ -138,56 +182,83 @@ def search():
             "default_search": f"ytsearch{limit}",
         }
 
-        results = []
-
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
+            search_info = ydl.extract_info(
+                f"ytsearch{limit}:{q}",
+                download=False
+            )
 
-        entries = info.get("entries") or []
+        entries = search_info.get("entries") or []
+
+        results = []
 
         for item in entries:
             if not item:
                 continue
 
-            video_url = item.get("webpage_url") or item.get("url")
-
-            if not video_url:
-                continue
-
             try:
-                # فقط برای مواردی که metadata ناقص دارند
-                title = item.get("title") or ""
-
-                artist = (
-                    item.get("channel")
-                    or item.get("uploader")
-                    or ""
+                video_url = (
+                    item.get("webpage_url")
+                    or item.get("url")
                 )
 
-                artist_url = (
+                if not video_url:
+                    video_id = item.get("id")
+
+                    if video_id:
+                        video_url = (
+                            f"https://www.youtube.com/watch?v={video_id}"
+                        )
+
+                if not video_url:
+                    continue
+
+                title = clean_text(item.get("title"))
+
+                if not title:
+                    continue
+
+                artist = clean_text(
+                    item.get("channel")
+                    or item.get("uploader")
+                    or item.get("creator")
+                )
+
+                artist_url = clean_text(
                     item.get("channel_url")
                     or item.get("uploader_url")
-                    or ""
                 )
 
                 duration = format_duration(
                     item.get("duration")
                 )
 
-                thumbnail = item.get("thumbnail") or ""
+                image = clean_text(
+                    item.get("thumbnail")
+                )
+
+                # بعضی نتایج extract_flat ممکن است thumbnail نداشته باشند
+                video_id = item.get("id")
+
+                if not image and video_id:
+                    image = (
+                        f"https://i.ytimg.com/vi/"
+                        f"{video_id}/hqdefault.jpg"
+                    )
 
                 results.append({
                     "artist": artist,
                     "artist_url": artist_url,
                     "duration": duration,
-                    "image": thumbnail,
+                    "image": image,
                     "stream": make_stream_url(video_url),
                     "title": title,
                     "url": video_url
                 })
 
             except Exception as e:
-                print(f"Skipping invalid search result: {e}")
+                # یک نتیجه خراب نباید کل search را 500 کند
+                print(f"[SEARCH] Skipping invalid result: {e}")
                 continue
 
         return jsonify({
@@ -198,7 +269,7 @@ def search():
         })
 
     except Exception as e:
-        print(f"Search error: {e}")
+        print(f"[SEARCH ERROR] {e}")
 
         return jsonify({
             "success": False,
@@ -210,224 +281,271 @@ def search():
 
 
 # =========================================================
-# Info
+# INFO
 # =========================================================
 
 @app.get("/api/info")
 def info():
-
     url = request.args.get("url", "").strip()
 
     if not url:
-        return json_error("Missing url")
+        return jsonify({
+            "success": False,
+            "error": "Missing url parameter"
+        }), 400
 
     try:
-
         data = get_yt_info(url)
 
-        source_url = (
-            data.get("webpage_url")
-            or url
-        )
-
         return jsonify({
+            "success": True,
+            "title": data.get("title"),
             "artist": (
                 data.get("channel")
                 or data.get("uploader")
-                or "Unknown"
+                or ""
             ),
             "artist_url": (
                 data.get("channel_url")
                 or data.get("uploader_url")
+                or ""
             ),
             "duration": format_duration(
                 data.get("duration")
             ),
             "image": data.get("thumbnail"),
-            "stream": make_stream_url(source_url),
-            "title": data.get("title"),
-            "url": source_url
+            "url": url,
+            "stream": make_stream_url(url)
         })
 
     except Exception as e:
+        print(f"[INFO ERROR] {e}")
 
-        return json_error(
-            "Could not get information",
-            500,
-            str(e)
-        )
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 # =========================================================
-# Stream Proxy
+# STREAM
 # =========================================================
 
 @app.get("/api/stream")
 def stream():
-
     url = request.args.get("url", "").strip()
 
     if not url:
-        return json_error("Missing url")
-
-    upstream = None
+        return jsonify({
+            "success": False,
+            "error": "Missing url parameter"
+        }), 400
 
     try:
-
         # -------------------------------------------------
-        # Extract current direct audio URL
+        # Get direct audio URL
         # -------------------------------------------------
 
-        info = get_yt_info(url)
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+
+            # فقط بهترین صدای قابل دسترس
+            "format": "bestaudio/best",
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
 
         direct_url = info.get("url")
 
         if not direct_url:
-            return json_error(
-                "Audio stream not found",
-                404
-            )
+            return jsonify({
+                "success": False,
+                "error": "Could not extract audio stream"
+            }), 500
 
         # -------------------------------------------------
         # Forward Range
         # -------------------------------------------------
 
-        headers = {
-            "User-Agent": request.headers.get(
-                "User-Agent",
-                "Mozilla/5.0"
-            ),
-            "Accept": "*/*"
-        }
-
         range_header = request.headers.get("Range")
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/152.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+        }
 
         if range_header:
             headers["Range"] = range_header
 
         # -------------------------------------------------
-        # Request upstream audio
+        # Connect to upstream
         # -------------------------------------------------
 
         upstream = requests.get(
             direct_url,
             headers=headers,
             stream=True,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True
+            timeout=(15, 60)
         )
 
-        if upstream.status_code >= 400:
+        status_code = upstream.status_code
 
-            status = upstream.status_code
+        # -------------------------------------------------
+        # Handle errors
+        # -------------------------------------------------
+
+        if status_code >= 400:
+            error_text = ""
 
             try:
-                details = upstream.text[:1000]
+                error_text = upstream.text[:500]
             except Exception:
-                details = None
+                pass
 
             upstream.close()
 
-            return json_error(
-                "Upstream request failed",
-                status,
-                details
-            )
+            return jsonify({
+                "success": False,
+                "error": "Upstream stream request failed",
+                "status": status_code,
+                "details": error_text
+            }), status_code
 
         # -------------------------------------------------
-        # Copy important headers
+        # Headers
         # -------------------------------------------------
 
-        response_headers = {}
-
-        for header in [
-            "Content-Type",
-            "Content-Length",
-            "Content-Range",
-            "Accept-Ranges",
-            "ETag",
-            "Last-Modified"
-        ]:
-
-            value = upstream.headers.get(header)
-
-            if value:
-                response_headers[header] = value
-
-        # Make browser aware that seeking is supported
-        response_headers["Accept-Ranges"] = "bytes"
-
-        response_headers["Cache-Control"] = (
-            "no-cache, no-store, must-revalidate"
+        content_type = (
+            upstream.headers.get("Content-Type")
+            or "audio/mpeg"
         )
 
-        response_headers["X-Accel-Buffering"] = "no"
+        content_length = upstream.headers.get(
+            "Content-Length"
+        )
+
+        content_range = upstream.headers.get(
+            "Content-Range"
+        )
+
+        accept_ranges = upstream.headers.get(
+            "Accept-Ranges"
+        )
+
+        etag = upstream.headers.get("ETag")
+
+        last_modified = upstream.headers.get(
+            "Last-Modified"
+        )
 
         # -------------------------------------------------
-        # Stream
+        # Generator
         # -------------------------------------------------
 
         def generate():
-
-            nonlocal upstream
-
             try:
-
                 for chunk in upstream.iter_content(
-                    chunk_size=CHUNK_SIZE
+                    chunk_size=256 * 1024
                 ):
-
                     if chunk:
                         yield chunk
 
             finally:
-
-                try:
-                    upstream.close()
-                except Exception:
-                    pass
-
-        return Response(
-            generate(),
-            status=upstream.status_code,
-            headers=response_headers,
-            direct_passthrough=True
-        )
-
-    except requests.RequestException as e:
-
-        if upstream:
-            try:
                 upstream.close()
-            except Exception:
-                pass
 
-        return json_error(
-            "Network error",
-            502,
-            str(e)
+        # -------------------------------------------------
+        # Response
+        # -------------------------------------------------
+
+        response = Response(
+            generate(),
+            status=status_code,
+            content_type=content_type
         )
+
+        # CORS
+        response.headers["Access-Control-Allow-Origin"] = "*"
+
+        response.headers["Access-Control-Expose-Headers"] = (
+            "Content-Length, Content-Range, Accept-Ranges, "
+            "Content-Type, ETag, Last-Modified"
+        )
+
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Range, Content-Type, Accept, Origin, User-Agent"
+        )
+
+        # Range / Seeking
+        response.headers["Accept-Ranges"] = (
+            accept_ranges or "bytes"
+        )
+
+        if content_length:
+            response.headers["Content-Length"] = content_length
+
+        if content_range:
+            response.headers["Content-Range"] = content_range
+
+        if etag:
+            response.headers["ETag"] = etag
+
+        if last_modified:
+            response.headers["Last-Modified"] = last_modified
+
+        return response
 
     except Exception as e:
+        print(f"[STREAM ERROR] {e}")
 
-        if upstream:
-            try:
-                upstream.close()
-            except Exception:
-                pass
-
-        return json_error(
-            "Streaming failed",
-            500,
-            str(e)
-        )
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 # =========================================================
-# Railway
+# 404
+# =========================================================
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        "success": False,
+        "error": "Endpoint not found"
+    }), 404
+
+
+# =========================================================
+# 500
+# =========================================================
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        "success": False,
+        "error": "Internal server error"
+    }), 500
+
+
+# =========================================================
+# Local run
 # =========================================================
 
 if __name__ == "__main__":
+    import os
 
     port = int(
         os.environ.get("PORT", 8080)
@@ -436,5 +554,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=port,
-        threaded=True
+        debug=False
     )
